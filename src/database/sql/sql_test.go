@@ -3979,13 +3979,14 @@ func TestMaxIdleTime(t *testing.T) {
 	usedConns := 5
 	reusedConns := 2
 	list := []struct {
-		wantMaxIdleTime   time.Duration
-		wantMaxLifetime   time.Duration
-		wantNextCheck     time.Duration
-		wantIdleClosed    int64
-		wantMaxIdleClosed int64
-		timeOffset        time.Duration
-		secondTimeOffset  time.Duration
+		wantMaxIdleTime        time.Duration
+		wantMaxLifetime        time.Duration
+		wantNextCheck          time.Duration
+		wantIdleClosed         int64
+		wantMaxIdleClosed      int64
+		timeOffset             time.Duration
+		secondTimeOffset       time.Duration
+		cachedConnPickStrategy cachedConnPickStrategy
 	}{
 		{
 			time.Millisecond,
@@ -3995,6 +3996,7 @@ func TestMaxIdleTime(t *testing.T) {
 			int64(usedConns - reusedConns),
 			10 * time.Millisecond,
 			0,
+			mostRecentlyUsedStrategy,
 		},
 		{
 			// Want to close some connections via max idle time and one by max lifetime.
@@ -4010,6 +4012,25 @@ func TestMaxIdleTime(t *testing.T) {
 			10 * time.Millisecond,
 			// Add second offset because otherwise connections are expired via max lifetime in Close.
 			100 * time.Nanosecond,
+			mostRecentlyUsedStrategy,
+		},
+		{
+			// Want to close some connections via max idle time and one by max lifetime.
+			time.Millisecond,
+			// nowFunc() - MaxLifetime should be 5 * time.Nanosecond in connectionCleanerRunLocked.
+			// This guarantees that fourth opened connection is to be closed. Fourth connection is opened at
+			// 4 ns.
+			// Thus it is timeOffset + secondTimeOffset + 4 (+2 for Close while reusing conns and +2 for Conn) - 5 (creationTime 5ns before
+			// will be fourth connection).
+			10*time.Millisecond + 100*time.Nanosecond - time.Nanosecond,
+			0, // The fifth connection's MaxLifeTime is reached by timeOffset + secondTimeOffset + 4 ns as the creation time is at 5ns.
+			// Closed all not reused connections and extra one by max lifetime.
+			int64(usedConns - reusedConns + 1),
+			int64(usedConns - reusedConns),
+			10 * time.Millisecond,
+			// Add second offset because otherwise connections are expired via max lifetime in Close.
+			100 * time.Nanosecond,
+			leastRecentlyUsedStrategy,
 		},
 		{
 			time.Hour,
@@ -4018,7 +4039,9 @@ func TestMaxIdleTime(t *testing.T) {
 			0,
 			0,
 			10 * time.Millisecond,
-			0},
+			0,
+			mostRecentlyUsedStrategy,
+		},
 	}
 	baseTime := time.Unix(0, 0)
 	defer func() {
@@ -4036,6 +4059,9 @@ func TestMaxIdleTime(t *testing.T) {
 			db.SetMaxIdleConns(usedConns)
 			db.SetConnMaxIdleTime(item.wantMaxIdleTime)
 			db.SetConnMaxLifetime(item.wantMaxLifetime)
+			if item.cachedConnPickStrategy == leastRecentlyUsedStrategy {
+				db.SetLeastRecentlyUsedCachedConnectionStrategy()
+			}
 
 			preMaxIdleClosed := db.Stats().MaxIdleTimeClosed
 

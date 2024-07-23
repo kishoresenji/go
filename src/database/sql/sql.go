@@ -515,19 +515,20 @@ type DB struct {
 	// maybeOpenNewConnections sends on the chan (one send per needed connection)
 	// It is closed during db.Close(). The close tells the connectionOpener
 	// goroutine to exit.
-	openerCh          chan struct{}
-	closed            bool
-	dep               map[finalCloser]depSet
-	lastPut           map[*driverConn]string // stacktrace of last conn's put; debug only
-	maxIdleCount      int                    // zero means defaultMaxIdleConns; negative means 0
-	maxOpen           int                    // <= 0 means unlimited
-	maxLifetime       time.Duration          // maximum amount of time a connection may be reused
-	maxIdleTime       time.Duration          // maximum amount of time a connection may be idle before being closed
-	cleanerCh         chan struct{}
-	waitCount         int64 // Total number of connections waited for.
-	maxIdleClosed     int64 // Total number of connections closed due to idle count.
-	maxIdleTimeClosed int64 // Total number of connections closed due to idle time.
-	maxLifetimeClosed int64 // Total number of connections closed due to max connection lifetime limit.
+	openerCh               chan struct{}
+	closed                 bool
+	dep                    map[finalCloser]depSet
+	lastPut                map[*driverConn]string // stacktrace of last conn's put; debug only
+	maxIdleCount           int                    // zero means defaultMaxIdleConns; negative means 0
+	maxOpen                int                    // <= 0 means unlimited
+	maxLifetime            time.Duration          // maximum amount of time a connection may be reused
+	maxIdleTime            time.Duration          // maximum amount of time a connection may be idle before being closed
+	cleanerCh              chan struct{}
+	waitCount              int64 // Total number of connections waited for.
+	maxIdleClosed          int64 // Total number of connections closed due to idle count.
+	maxIdleTimeClosed      int64 // Total number of connections closed due to idle time.
+	maxLifetimeClosed      int64 // Total number of connections closed due to max connection lifetime limit.
+	cachedConnPickStrategy cachedConnPickStrategy
 
 	stop func() // stop cancels the connection opener.
 }
@@ -542,6 +543,13 @@ const (
 	// for one to become available (if MaxOpenConns has been reached) or
 	// creates a new database connection.
 	cachedOrNewConn
+)
+
+type cachedConnPickStrategy uint8
+
+const (
+	mostRecentlyUsedStrategy cachedConnPickStrategy = iota
+	leastRecentlyUsedStrategy
 )
 
 // driverConn wraps a driver.Conn with a mutex, to
@@ -1076,6 +1084,12 @@ func (db *DB) SetConnMaxIdleTime(d time.Duration) {
 	db.startCleanerLocked()
 }
 
+func (db *DB) SetLeastRecentlyUsedCachedConnectionStrategy() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.cachedConnPickStrategy = leastRecentlyUsedStrategy
+}
+
 // startCleanerLocked starts connectionCleaner if needed.
 func (db *DB) startCleanerLocked() {
 	if (db.maxLifetime > 0 || db.maxIdleTime > 0) && db.numOpen > 0 && db.cleanerCh == nil {
@@ -1319,30 +1333,26 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		return nil, ctx.Err()
 	}
 	lifetime := db.maxLifetime
-
 	// Prefer a free connection, if possible.
-	last := len(db.freeConn) - 1
-	if strategy == cachedOrNewConn && last >= 0 {
-		// Reuse the lowest idle time connection so we can close
-		// connections which remain idle as soon as possible.
-		conn := db.freeConn[last]
-		db.freeConn = db.freeConn[:last]
-		conn.inUse = true
-		if conn.expired(lifetime) {
-			db.maxLifetimeClosed++
+	if strategy == cachedOrNewConn {
+		if conn := db.getCachedConnDBLocked(); conn != nil {
+			conn.inUse = true
+			if conn.expired(lifetime) {
+				db.maxLifetimeClosed++
+				db.mu.Unlock()
+				conn.Close()
+				return nil, driver.ErrBadConn
+			}
 			db.mu.Unlock()
-			conn.Close()
-			return nil, driver.ErrBadConn
-		}
-		db.mu.Unlock()
 
-		// Reset the session if required.
-		if err := conn.resetSession(ctx); errors.Is(err, driver.ErrBadConn) {
-			conn.Close()
-			return nil, err
-		}
+			// Reset the session if required.
+			if err := conn.resetSession(ctx); errors.Is(err, driver.ErrBadConn) {
+				conn.Close()
+				return nil, err
+			}
 
-		return conn, nil
+			return conn, nil
+		}
 	}
 
 	// Out of free connections or we were asked not to use one. If we're not
@@ -1462,6 +1472,23 @@ func (db *DB) noteUnusedDriverStatement(c *driverConn, ds *driverStmt) {
 			ds.Close()
 		}
 	}
+}
+
+func (db *DB) getCachedConnDBLocked() *driverConn {
+	var conn *driverConn
+	if len(db.freeConn) == 0 {
+		return conn
+	}
+	switch db.cachedConnPickStrategy {
+	case leastRecentlyUsedStrategy:
+		conn = db.freeConn[0]
+		db.freeConn = db.freeConn[1:]
+	default:
+		last := len(db.freeConn) - 1
+		conn = db.freeConn[last]
+		db.freeConn = db.freeConn[:last]
+	}
+	return conn
 }
 
 // debugGetPut determines whether getConn & putConn calls' stack traces
